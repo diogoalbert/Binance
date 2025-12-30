@@ -11,117 +11,106 @@ def clean_val(val_str):
     try: return float(s)
     except: return 0.0
 
-def processar_portugal_final_2025():
-    bt_input = 'Relatorio_FIFO_Completo_Contraparte.csv'
+def processar_vendas_totais():
     binance_input = 'Binance_Novembro2019-Dezembro2025.csv'
-    output_name = 'Relatorio_IRS_Portugal_2025_Final.csv'
+    bt_input = 'Relatorio_FIFO_Completo_Contraparte.csv'
+    output_name = 'RELATORIO_FINAL_TODOS_OS_ANOS.csv'
 
-    inventory = {'Binance': {}}
-    
-    # 1. HERANÇA DA BITCOINTRADE (Sincronização de saída/entrada)
-    bt_transferencias = {}
+    # 1. Carregar Dados
+    df = pd.read_csv(binance_input)
+    df['UTC_Time'] = pd.to_datetime(df['UTC_Time'])
+    df['Val_Numeric'] = df['Change'].apply(clean_val)
+    # Arredondamos o tempo para os 2 segundos mais próximos para agrupar transações separadas por milissegundos
+    df['Time_Group'] = df['UTC_Time'].dt.round('2s') 
+    df = df.sort_values('UTC_Time')
+
+    inventory = {}
+    final_report = []
+    FIAT_ESTATAL = ['EUR', 'BRL', 'USD']
+
+    # --- CARREGAR INVENTÁRIO INICIAL (BitcoinTrade) ---
     if os.path.exists(bt_input):
         df_bt = pd.read_csv(bt_input, sep=';', decimal=',')
         for _, row in df_bt.iterrows():
             if 'Retirada' in str(row['operação']):
                 m = row['Moeda']
-                if m not in bt_transferencias: bt_transferencias[m] = []
-                bt_transferencias[m].append({'qty': abs(float(row['quantidade'])), 'cost': float(row['Valor (Custo FIFO)']), 'date': row['Data']})
+                if m not in inventory: inventory[m] = []
+                inventory[m].append({'qty': abs(float(row['quantidade'])), 'cost': float(row['Valor (Custo FIFO)']), 'date': row['Data']})
 
-    # 2. PROCESSAR BINANCE (Foco no Change e não no nome da Operação)
-    df_bin = pd.read_csv(binance_input)
-    df_bin['UTC_Time'] = pd.to_datetime(df_bin['UTC_Time'])
-    df_bin['Val_Numeric'] = df_bin['Change'].apply(clean_val)
-    df_bin = df_bin.sort_values('UTC_Time')
+    # --- PROCESSAR CRONOLOGIA BINANCE ---
+    print("Iniciando processamento de 2018 a 2025...")
 
-    final_report = []
-    FIAT_ESTATAL = ['EUR', 'BRL', 'USD']
-
-    for ts, group in df_bin.groupby('UTC_Time'):
-        data_evento = ts.strftime('%Y-%m-%d')
+    for tg, group in df.groupby('Time_Group'):
+        data_s = tg.strftime('%Y-%m-%d')
         
-        # Filtramos moedas que entram (+) e que saem (-)
         entradas = group[group['Val_Numeric'] > 0]
         saidas = group[group['Val_Numeric'] < 0]
 
-        # A) ALIMENTAR INVENTÁRIO (Qualquer entrada que não seja Fiat)
+        # 1. Registrar Entradas (Depósitos e Swaps)
         for _, ent in entradas.iterrows():
             m = ent['Coin']
-            if m in FIAT_ESTATAL: continue # Fiat não entra no inventário de cripto
+            if m in FIAT_ESTATAL: continue
+            if m not in inventory: inventory[m] = []
             
-            if m not in inventory['Binance']: inventory['Binance'][m] = []
-            
-            # Se for depósito, tenta match com BT
-            custo, dt_acq = 0.0, data_evento
-            if ent['Operation'] == 'Deposit' and m in bt_transferencias and bt_transferencias[m]:
-                lote_origem = bt_transferencias[m].pop(0)
-                custo, dt_acq = lote_origem['cost'], lote_origem['date']
-            
-            inventory['Binance'][m].append({'qty': ent['Val_Numeric'], 'cost': custo, 'date': dt_acq})
+            # Se não é compra com fiat, o custo vem do swap ou é zero (rendimentos)
+            # Simplificação: custo zero para entradas diretas, herança via Swaps abaixo
+            inventory[m].append({'qty': ent['Val_Numeric'], 'cost': 0.0, 'date': data_s})
 
-        # B) PROCESSAR SAÍDAS (Vendas para Fiat ou Swaps)
-        if not saidas.empty:
-            for _, s in saidas.iterrows():
-                # Ignoramos taxas isoladas (serão deduzidas do custo no futuro se necessário)
-                if 'Fee' in s['Operation']: continue
+        # 2. Processar Saídas (Vendas ou Swaps)
+        for _, s in saidas.iterrows():
+            if 'Fee' in s['Operation']: continue
+            moeda_sai = s['Coin']
+            qtd_sai = abs(s['Val_Numeric'])
+            
+            # Verifica se houve entrada de Fiat no mesmo grupo de tempo
+            fiat_entry = entradas[entradas['Coin'].isin(FIAT_ESTATAL)]
+            
+            if not fiat_entry.empty:
+                # VENDA TRIBUTÁVEL
+                valor_fiat = abs(fiat_entry['Val_Numeric'].sum())
                 
-                moeda_sai = s['Coin']
-                qtd_total_venda = abs(s['Val_Numeric'])
-                
-                # Identifica se houve entrada de Fiat no mesmo segundo (Venda Tributável)
-                fiat_entry = entradas[entradas['Coin'].isin(FIAT_ESTATAL)]
-                
-                if not fiat_entry.empty:
-                    valor_fiat_recebido = abs(fiat_entry['Val_Numeric'].sum())
+                # Se o inventário estiver vazio (erro de log), cria lote para não travar
+                if moeda_sai not in inventory or not inventory[moeda_sai]:
+                    inventory[moeda_sai] = [{'qty': 1000000.0, 'cost': 0.0, 'date': 'ORIGEM_DESCONHECIDA'}]
+
+                qtd_restante = qtd_sai
+                while qtd_restante > 1e-10 and inventory[moeda_sai]:
+                    lote = inventory[moeda_sai][0]
+                    vender = min(lote['qty'], qtd_restante)
                     
-                    # DESMEMBRAMENTO POR LOTE (FIFO)
-                    qtd_restante = qtd_total_venda
-                    if moeda_sai in inventory['Binance']:
-                        while qtd_restante > 1e-10 and inventory['Binance'][moeda_sai]:
-                            lote = inventory['Binance'][moeda_sai][0]
-                            vender_deste_lote = min(lote['qty'], qtd_restante)
-                            
-                            # Proporções para o rateio
-                            prop_venda = vender_deste_lote / qtd_total_venda
-                            custo_prop = (lote['cost'] / lote['qty']) * vender_deste_lote if lote['qty'] > 0 else 0
-                            receita_prop = valor_fiat_recebido * prop_venda
-                            
-                            final_report.append({
-                                'Data_Venda': data_evento,
-                                'Moeda': moeda_sai,
-                                'Quantidade': round(vender_deste_lote, 8),
-                                'Data_Aquisição': lote['date'], # UMA DATA POR LINHA
-                                'Custo_Aquisição': round(custo_prop, 2),
-                                'Valor_Venda': round(receita_prop, 2),
-                                'Resultado': round(receita_prop - custo_prop, 2),
-                                'Moeda_Recebida': fiat_entry['Coin'].iloc[0]
-                            })
-                            
-                            # Atualiza lote
-                            if lote['qty'] <= qtd_restante:
-                                qtd_restante -= lote['qty']
-                                inventory['Binance'][moeda_sai].pop(0)
-                            else:
-                                lote['qty'] -= vender_deste_lote
-                                lote['cost'] -= custo_prop
-                                qtd_restante = 0
-                else:
-                    # SWAP (Troca Cripto-Cripto/Stablecoin): Herança de Custo
-                    # Consome o lote da moeda que sai e passa o custo para a que entra
+                    prop = vender / qtd_sai
+                    custo_lote = (lote['cost'] / lote['qty']) * vender if lote['qty'] > 0 else 0
+                    
+                    final_report.append({
+                        'Data_Venda': data_s,
+                        'Moeda': moeda_sai,
+                        'Quantidade': round(vender, 8),
+                        'Data_Aquisição': lote['date'],
+                        'Custo_Aquisição': round(custo_lote, 2),
+                        'Valor_Venda': round(valor_fiat * prop, 2),
+                        'Resultado': round((valor_fiat * prop) - custo_lote, 2)
+                    })
+                    
+                    if lote['qty'] <= qtd_restante:
+                        qtd_restante -= lote['qty']
+                        inventory[moeda_sai].pop(0)
+                    else:
+                        lote['qty'] -= vender
+                        lote['cost'] -= custo_lote
+                        qtd_restante = 0
+            else:
+                # É UM SWAP OU RETIRADA (Transfere saldo/custo internamente)
+                # (Lógica simplificada para manter o fluxo de datas)
+                if moeda_sai in inventory and inventory[moeda_sai]:
+                    lote_velho = inventory[moeda_sai].pop(0)
                     for _, e in entradas.iterrows():
-                        if moeda_sai in inventory['Binance'] and inventory['Binance'][moeda_sai]:
-                            lote_origem = inventory['Binance'][moeda_sai].pop(0)
-                            m_nova = e['Coin']
-                            if m_nova not in inventory['Binance']: inventory['Binance'][m_nova] = []
-                            inventory['Binance'][m_nova].append({
-                                'qty': e['Val_Numeric'], 
-                                'cost': lote_origem['cost'], 
-                                'date': lote_origem['date']
-                            })
+                        m_nova = e['Coin']
+                        if m_nova not in inventory: inventory[m_nova] = []
+                        inventory[m_nova].append({'qty': e['Val_Numeric'], 'cost': lote_velho['cost'], 'date': lote_velho['date']})
 
-    # Exportação
     pd.DataFrame(final_report).to_csv(output_name, sep=';', index=False, decimal=',')
-    print(f"Sucesso! Relatório desmembrado (2018-2025) gerado em: {output_name}")
+    print(f"Relatório gerado com sucesso: {output_name}")
+    print(f"Total de linhas processadas: {len(final_report)}")
 
 if __name__ == "__main__":
-    processar_portugal_final_2025()
+    processar_vendas_totais()
